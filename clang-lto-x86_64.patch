@@ -1,0 +1,871 @@
+From 99d0021569c71c325f41a7dd0a08a380010ce95c Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Thu, 6 Aug 2020 15:14:09 -0700
+Subject: objtool: Add a pass for generating __mcount_loc
+
+Add the --mcount option for generating __mcount_loc sections
+needed for dynamic ftrace. Using this pass requires the kernel to
+be compiled with -mfentry and CC_USING_NOP_MCOUNT to be defined
+in Makefile.
+
+Link: https://lore.kernel.org/lkml/20200625200235.GQ4781@hirez.programming.kicks-ass.net/
+Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+[Sami: rebased, dropped config changes, fixed to actually use --mcount,
+       and wrote a commit message.]
+Signed-off-by: Sami Tolvanen <samitolvanen@google.com>
+Reviewed-by: Kees Cook <keescook@chromium.org>
+---
+ tools/objtool/builtin-check.c |  3 +-
+ tools/objtool/builtin.h       |  2 +-
+ tools/objtool/check.c         | 82 +++++++++++++++++++++++++++++++++++++++++++
+ tools/objtool/check.h         |  1 +
+ tools/objtool/objtool.c       |  1 +
+ tools/objtool/objtool.h       |  1 +
+ 6 files changed, 88 insertions(+), 2 deletions(-)
+
+diff --git a/tools/objtool/builtin-check.c b/tools/objtool/builtin-check.c
+index c6d199bfd0ae2..e92e76f691769 100644
+--- a/tools/objtool/builtin-check.c
++++ b/tools/objtool/builtin-check.c
+@@ -18,7 +18,7 @@
+ #include "builtin.h"
+ #include "objtool.h"
+ 
+-bool no_fp, no_unreachable, retpoline, module, backtrace, uaccess, stats, validate_dup, vmlinux;
++bool no_fp, no_unreachable, retpoline, module, backtrace, uaccess, stats, validate_dup, vmlinux, mcount;
+ 
+ static const char * const check_usage[] = {
+ 	"objtool check [<options>] file.o",
+@@ -35,6 +35,7 @@ const struct option check_options[] = {
+ 	OPT_BOOLEAN('s', "stats", &stats, "print statistics"),
+ 	OPT_BOOLEAN('d', "duplicate", &validate_dup, "duplicate validation for vmlinux.o"),
+ 	OPT_BOOLEAN('l', "vmlinux", &vmlinux, "vmlinux.o validation"),
++	OPT_BOOLEAN('M', "mcount", &mcount, "generate __mcount_loc"),
+ 	OPT_END(),
+ };
+ 
+diff --git a/tools/objtool/builtin.h b/tools/objtool/builtin.h
+index 85c979caa3677..94565a72b7010 100644
+--- a/tools/objtool/builtin.h
++++ b/tools/objtool/builtin.h
+@@ -8,7 +8,7 @@
+ #include <subcmd/parse-options.h>
+ 
+ extern const struct option check_options[];
+-extern bool no_fp, no_unreachable, retpoline, module, backtrace, uaccess, stats, validate_dup, vmlinux;
++extern bool no_fp, no_unreachable, retpoline, module, backtrace, uaccess, stats, validate_dup, vmlinux, mcount;
+ 
+ extern int cmd_check(int argc, const char **argv);
+ extern int cmd_orc(int argc, const char **argv);
+diff --git a/tools/objtool/check.c b/tools/objtool/check.c
+index 5f8d3eed78a18..44e3ee1425cd5 100644
+--- a/tools/objtool/check.c
++++ b/tools/objtool/check.c
+@@ -530,6 +530,65 @@ static int create_static_call_sections(struct objtool_file *file)
+ 	return 0;
+ }
+ 
++static int create_mcount_loc_sections(struct objtool_file *file)
++{
++	struct section *sec, *reloc_sec;
++	struct reloc *reloc;
++	unsigned long *loc;
++	struct instruction *insn;
++	int idx;
++
++	sec = find_section_by_name(file->elf, "__mcount_loc");
++	if (sec) {
++		INIT_LIST_HEAD(&file->mcount_loc_list);
++		WARN("file already has __mcount_loc section, skipping");
++		return 0;
++	}
++
++	if (list_empty(&file->mcount_loc_list))
++		return 0;
++
++	idx = 0;
++	list_for_each_entry(insn, &file->mcount_loc_list, mcount_loc_node)
++		idx++;
++
++	sec = elf_create_section(file->elf, "__mcount_loc", 0, sizeof(unsigned long), idx);
++	if (!sec)
++		return -1;
++
++	reloc_sec = elf_create_reloc_section(file->elf, sec, SHT_RELA);
++	if (!reloc_sec)
++		return -1;
++
++	idx = 0;
++	list_for_each_entry(insn, &file->mcount_loc_list, mcount_loc_node) {
++
++		loc = (unsigned long *)sec->data->d_buf + idx;
++		memset(loc, 0, sizeof(unsigned long));
++
++		reloc = malloc(sizeof(*reloc));
++		if (!reloc) {
++			perror("malloc");
++			return -1;
++		}
++		memset(reloc, 0, sizeof(*reloc));
++
++		reloc->sym = insn->sec->sym;
++		reloc->addend = insn->offset;
++		reloc->type = R_X86_64_64;
++		reloc->offset = idx * sizeof(unsigned long);
++		reloc->sec = reloc_sec;
++		elf_add_reloc(file->elf, reloc);
++
++		idx++;
++	}
++
++	if (elf_rebuild_reloc_section(file->elf, reloc_sec))
++		return -1;
++
++	return 0;
++}
++
+ /*
+  * Warnings shouldn't be reported for ignored functions.
+  */
+@@ -956,6 +1015,22 @@ static int add_call_destinations(struct objtool_file *file)
+ 			insn->type = INSN_NOP;
+ 		}
+ 
++		if (mcount && !strcmp(insn->call_dest->name, "__fentry__")) {
++			if (reloc) {
++				reloc->type = R_NONE;
++				elf_write_reloc(file->elf, reloc);
++			}
++
++			elf_write_insn(file->elf, insn->sec,
++				       insn->offset, insn->len,
++				       arch_nop_insn(insn->len));
++
++			insn->type = INSN_NOP;
++
++			list_add_tail(&insn->mcount_loc_node,
++				      &file->mcount_loc_list);
++		}
++
+ 		/*
+ 		 * Whatever stack impact regular CALLs have, should be undone
+ 		 * by the RETURN of the called function.
+@@ -2927,6 +3002,13 @@ int check(struct objtool_file *file)
+ 		goto out;
+ 	warnings += ret;
+ 
++	if (mcount) {
++		ret = create_mcount_loc_sections(file);
++		if (ret < 0)
++			goto out;
++		warnings += ret;
++	}
++
+ out:
+ 	if (ret < 0) {
+ 		/*
+diff --git a/tools/objtool/check.h b/tools/objtool/check.h
+index 5ec00a4b891b6..070baec2050a5 100644
+--- a/tools/objtool/check.h
++++ b/tools/objtool/check.h
+@@ -23,6 +23,7 @@ struct instruction {
+ 	struct list_head list;
+ 	struct hlist_node hash;
+ 	struct list_head static_call_node;
++	struct list_head mcount_loc_node;
+ 	struct section *sec;
+ 	unsigned long offset;
+ 	unsigned int len;
+diff --git a/tools/objtool/objtool.c b/tools/objtool/objtool.c
+index 9df0cd86d310d..c1819a6f2a18f 100644
+--- a/tools/objtool/objtool.c
++++ b/tools/objtool/objtool.c
+@@ -62,6 +62,7 @@ struct objtool_file *objtool_open_read(const char *_objname)
+ 	INIT_LIST_HEAD(&file.insn_list);
+ 	hash_init(file.insn_hash);
+ 	INIT_LIST_HEAD(&file.static_call_list);
++	INIT_LIST_HEAD(&file.mcount_loc_list);
+ 	file.c_file = !vmlinux && find_section_by_name(file.elf, ".comment");
+ 	file.ignore_unreachables = no_unreachable;
+ 	file.hints = false;
+diff --git a/tools/objtool/objtool.h b/tools/objtool/objtool.h
+index 4125d4578b23b..cf004dd60c2ba 100644
+--- a/tools/objtool/objtool.h
++++ b/tools/objtool/objtool.h
+@@ -19,6 +19,7 @@ struct objtool_file {
+ 	struct list_head insn_list;
+ 	DECLARE_HASHTABLE(insn_hash, 20);
+ 	struct list_head static_call_list;
++	struct list_head mcount_loc_list;
+ 	bool ignore_unreachables, c_file, hints, rodata;
+ };
+ 
+-- 
+cgit 1.2.3-1.el7
+
+
+From 18a14575ae31c5a97a5e87e961932a5016d369be Mon Sep 17 00:00:00 2001
+From: Sami Tolvanen <samitolvanen@google.com>
+Date: Wed, 28 Oct 2020 10:16:26 -0700
+Subject: objtool: Fix __mcount_loc generation with Clang's assembler
+
+When objtool generates relocations for the __mcount_loc section, it
+tries to reference __fentry__ calls by their section symbol offset.
+However, this fails with Clang's integrated assembler as it may not
+generate section symbols for every section. This patch looks up a
+function symbol instead if the section symbol is missing, similarly
+to commit e81e07244325 ("objtool: Support Clang non-section symbols
+in ORC generation").
+
+Signed-off-by: Sami Tolvanen <samitolvanen@google.com>
+---
+ tools/objtool/check.c | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/tools/objtool/check.c b/tools/objtool/check.c
+index 44e3ee1425cd5..ab87fb92793ce 100644
+--- a/tools/objtool/check.c
++++ b/tools/objtool/check.c
+@@ -573,8 +573,21 @@ static int create_mcount_loc_sections(struct objtool_file *file)
+ 		}
+ 		memset(reloc, 0, sizeof(*reloc));
+ 
+-		reloc->sym = insn->sec->sym;
+-		reloc->addend = insn->offset;
++		if (insn->sec->sym) {
++			reloc->sym = insn->sec->sym;
++			reloc->addend = insn->offset;
++		} else {
++			reloc->sym = find_symbol_containing(insn->sec, insn->offset);
++
++			if (!reloc->sym) {
++				WARN("missing symbol for insn at offset 0x%lx\n",
++				     insn->offset);
++				return -1;
++			}
++
++			reloc->addend = insn->offset - reloc->sym->offset;
++		}
++
+ 		reloc->type = R_X86_64_64;
+ 		reloc->offset = idx * sizeof(unsigned long);
+ 		reloc->sec = reloc_sec;
+-- 
+cgit 1.2.3-1.el7
+
+
+From 0e731dbc18241d68318e0a7d2c2c0087c9073fb9 Mon Sep 17 00:00:00 2001
+From: Sami Tolvanen <samitolvanen@google.com>
+Date: Fri, 17 Jul 2020 12:04:27 -0700
+Subject: objtool: Don't autodetect vmlinux.o
+
+With LTO, we run objtool on vmlinux.o, but don't want noinstr
+validation. This change requires --vmlinux to be passed to objtool
+explicitly.
+
+Suggested-by: Peter Zijlstra <peterz@infradead.org>
+Signed-off-by: Sami Tolvanen <samitolvanen@google.com>
+Reviewed-by: Kees Cook <keescook@chromium.org>
+---
+ scripts/link-vmlinux.sh       | 2 +-
+ tools/objtool/builtin-check.c | 6 +-----
+ 2 files changed, 2 insertions(+), 6 deletions(-)
+
+diff --git a/scripts/link-vmlinux.sh b/scripts/link-vmlinux.sh
+index c5919d5a0b4f2..423a4106f0dd1 100755
+--- a/scripts/link-vmlinux.sh
++++ b/scripts/link-vmlinux.sh
+@@ -106,7 +106,7 @@ objtool_link()
+ 	local objtoolopt;
+ 
+ 	if [ -n "${CONFIG_VMLINUX_VALIDATION}" ]; then
+-		objtoolopt="check"
++		objtoolopt="check --vmlinux"
+ 		if [ -z "${CONFIG_FRAME_POINTER}" ]; then
+ 			objtoolopt="${objtoolopt} --no-fp"
+ 		fi
+diff --git a/tools/objtool/builtin-check.c b/tools/objtool/builtin-check.c
+index e92e76f691769..facfc10bc5dc3 100644
+--- a/tools/objtool/builtin-check.c
++++ b/tools/objtool/builtin-check.c
+@@ -41,7 +41,7 @@ const struct option check_options[] = {
+ 
+ int cmd_check(int argc, const char **argv)
+ {
+-	const char *objname, *s;
++	const char *objname;
+ 	struct objtool_file *file;
+ 	int ret;
+ 
+@@ -52,10 +52,6 @@ int cmd_check(int argc, const char **argv)
+ 
+ 	objname = argv[0];
+ 
+-	s = strstr(objname, "vmlinux.o");
+-	if (s && !s[9])
+-		vmlinux = true;
+-
+ 	file = objtool_open_read(objname);
+ 	if (!file)
+ 		return 1;
+-- 
+cgit 1.2.3-1.el7
+
+
+From 22c8542d7b220ffc53816d47b371b1fe34341d4a Mon Sep 17 00:00:00 2001
+From: Sami Tolvanen <samitolvanen@google.com>
+Date: Fri, 25 Sep 2020 16:43:53 -0700
+Subject: tracing: add support for objtool mcount
+
+This change adds build support for using objtool to generate
+__mcount_loc sections.
+
+Signed-off-by: Sami Tolvanen <samitolvanen@google.com>
+---
+ Makefile               |  7 +++++++
+ kernel/trace/Kconfig   | 13 +++++++++++++
+ scripts/Makefile.build |  3 +++
+ 3 files changed, 23 insertions(+)
+
+diff --git a/Makefile b/Makefile
+index 2233951666f76..3189eacf31859 100644
+--- a/Makefile
++++ b/Makefile
+@@ -860,6 +860,9 @@ ifdef CONFIG_FTRACE_MCOUNT_USE_CC
+     endif
+   endif
+ endif
++ifdef CONFIG_FTRACE_MCOUNT_USE_OBJTOOL
++  CC_FLAGS_USING	+= -DCC_USING_NOP_MCOUNT
++endif
+ ifdef CONFIG_FTRACE_MCOUNT_USE_RECORDMCOUNT
+   ifdef CONFIG_HAVE_C_RECORDMCOUNT
+     BUILD_C_RECORDMCOUNT := y
+@@ -1236,6 +1239,10 @@ uapi-asm-generic:
+ PHONY += prepare-objtool prepare-resolve_btfids
+ prepare-objtool: $(objtool_target)
+ ifeq ($(SKIP_STACK_VALIDATION),1)
++ifdef CONFIG_FTRACE_MCOUNT_USE_OBJTOOL
++	@echo "error: Cannot generate __mcount_loc for CONFIG_DYNAMIC_FTRACE=y, please install libelf-dev, libelf-devel or elfutils-libelf-devel" >&2
++	@false
++endif
+ ifdef CONFIG_UNWINDER_ORC
+ 	@echo "error: Cannot generate ORC metadata for CONFIG_UNWINDER_ORC=y, please install libelf-dev, libelf-devel or elfutils-libelf-devel" >&2
+ 	@false
+diff --git a/kernel/trace/Kconfig b/kernel/trace/Kconfig
+index 3985a31a49b7f..936ccab1b938e 100644
+--- a/kernel/trace/Kconfig
++++ b/kernel/trace/Kconfig
+@@ -60,6 +60,11 @@ config HAVE_NOP_MCOUNT
+ 	help
+ 	  Arch supports the gcc options -pg with -mrecord-mcount and -nop-mcount
+ 
++config HAVE_OBJTOOL_MCOUNT
++	bool
++	help
++	  Arch supports objtool --mcount
++
+ config HAVE_C_RECORDMCOUNT
+ 	bool
+ 	help
+@@ -612,10 +617,18 @@ config FTRACE_MCOUNT_USE_CC
+ 	depends on !FTRACE_MCOUNT_USE_PATCHABLE_FUNCTION_ENTRY
+ 	depends on FTRACE_MCOUNT_RECORD
+ 
++config FTRACE_MCOUNT_USE_OBJTOOL
++	def_bool y
++	depends on HAVE_OBJTOOL_MCOUNT
++	depends on !FTRACE_MCOUNT_USE_PATCHABLE_FUNCTION_ENTRY
++	depends on !FTRACE_MCOUNT_USE_CC
++	depends on FTRACE_MCOUNT_RECORD
++
+ config FTRACE_MCOUNT_USE_RECORDMCOUNT
+ 	def_bool y
+ 	depends on !FTRACE_MCOUNT_USE_PATCHABLE_FUNCTION_ENTRY
+ 	depends on !FTRACE_MCOUNT_USE_CC
++	depends on !FTRACE_MCOUNT_USE_OBJTOOL
+ 	depends on FTRACE_MCOUNT_RECORD
+ 
+ config TRACING_MAP
+diff --git a/scripts/Makefile.build b/scripts/Makefile.build
+index d94fc9ab819d3..59fabd9685eec 100644
+--- a/scripts/Makefile.build
++++ b/scripts/Makefile.build
+@@ -238,6 +238,9 @@ endif
+ ifdef CONFIG_X86_SMAP
+   objtool_args += --uaccess
+ endif
++ifdef CONFIG_FTRACE_MCOUNT_USE_OBJTOOL
++  objtool_args += --mcount
++endif
+ 
+ # 'OBJECT_FILES_NON_STANDARD := y': skip objtool checking for a directory
+ # 'OBJECT_FILES_NON_STANDARD_foo.o := 'y': skip objtool checking for a file
+-- 
+cgit 1.2.3-1.el7
+
+
+From 6dafca97803309c3cb5148d449bfa711e41ddef2 Mon Sep 17 00:00:00 2001
+From: Sami Tolvanen <samitolvanen@google.com>
+Date: Thu, 6 Aug 2020 15:15:02 -0700
+Subject: x86, build: use objtool mcount
+
+Select HAVE_OBJTOOL_MCOUNT if STACK_VALIDATION is selected to use
+objtool to generate __mcount_loc sections for dynamic ftrace with
+Clang and gcc <5 (later versions of gcc use -mrecord-mcount).
+
+Signed-off-by: Sami Tolvanen <samitolvanen@google.com>
+Reviewed-by: Kees Cook <keescook@chromium.org>
+---
+ arch/x86/Kconfig | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index 7b6dd10b162ac..9cd9bd6562e34 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -167,6 +167,7 @@ config X86
+ 	select HAVE_CONTEXT_TRACKING		if X86_64
+ 	select HAVE_CONTEXT_TRACKING_OFFSTACK	if HAVE_CONTEXT_TRACKING
+ 	select HAVE_C_RECORDMCOUNT
++	select HAVE_OBJTOOL_MCOUNT		if STACK_VALIDATION
+ 	select HAVE_DEBUG_KMEMLEAK
+ 	select HAVE_DMA_CONTIGUOUS
+ 	select HAVE_DYNAMIC_FTRACE
+-- 
+cgit 1.2.3-1.el7
+
+
+From 41425ebe20245c99b44d6ba0f017be9bfc28414f Mon Sep 17 00:00:00 2001
+From: Sami Tolvanen <samitolvanen@google.com>
+Date: Wed, 30 Sep 2020 14:36:59 -0700
+Subject: objtool: Split noinstr validation from --vmlinux
+
+This change adds a --noinstr flag to objtool to allow us to specify
+that we're processing vmlinux.o without also enabling noinstr
+validation. This is needed to avoid false positives with LTO when we
+run objtool on vmlinux.o without CONFIG_DEBUG_ENTRY.
+
+Signed-off-by: Sami Tolvanen <samitolvanen@google.com>
+---
+ scripts/link-vmlinux.sh       | 2 +-
+ tools/objtool/builtin-check.c | 3 ++-
+ tools/objtool/builtin.h       | 2 +-
+ tools/objtool/check.c         | 2 +-
+ 4 files changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/scripts/link-vmlinux.sh b/scripts/link-vmlinux.sh
+index 423a4106f0dd1..18aed761f9c04 100755
+--- a/scripts/link-vmlinux.sh
++++ b/scripts/link-vmlinux.sh
+@@ -106,7 +106,7 @@ objtool_link()
+ 	local objtoolopt;
+ 
+ 	if [ -n "${CONFIG_VMLINUX_VALIDATION}" ]; then
+-		objtoolopt="check --vmlinux"
++		objtoolopt="check --vmlinux --noinstr"
+ 		if [ -z "${CONFIG_FRAME_POINTER}" ]; then
+ 			objtoolopt="${objtoolopt} --no-fp"
+ 		fi
+diff --git a/tools/objtool/builtin-check.c b/tools/objtool/builtin-check.c
+index facfc10bc5dc3..b84cdc72b51f1 100644
+--- a/tools/objtool/builtin-check.c
++++ b/tools/objtool/builtin-check.c
+@@ -18,7 +18,7 @@
+ #include "builtin.h"
+ #include "objtool.h"
+ 
+-bool no_fp, no_unreachable, retpoline, module, backtrace, uaccess, stats, validate_dup, vmlinux, mcount;
++bool no_fp, no_unreachable, retpoline, module, backtrace, uaccess, stats, validate_dup, vmlinux, mcount, noinstr;
+ 
+ static const char * const check_usage[] = {
+ 	"objtool check [<options>] file.o",
+@@ -34,6 +34,7 @@ const struct option check_options[] = {
+ 	OPT_BOOLEAN('a', "uaccess", &uaccess, "enable uaccess checking"),
+ 	OPT_BOOLEAN('s', "stats", &stats, "print statistics"),
+ 	OPT_BOOLEAN('d', "duplicate", &validate_dup, "duplicate validation for vmlinux.o"),
++	OPT_BOOLEAN('n', "noinstr", &noinstr, "noinstr validation for vmlinux.o"),
+ 	OPT_BOOLEAN('l', "vmlinux", &vmlinux, "vmlinux.o validation"),
+ 	OPT_BOOLEAN('M', "mcount", &mcount, "generate __mcount_loc"),
+ 	OPT_END(),
+diff --git a/tools/objtool/builtin.h b/tools/objtool/builtin.h
+index 94565a72b7010..2502bb27de171 100644
+--- a/tools/objtool/builtin.h
++++ b/tools/objtool/builtin.h
+@@ -8,7 +8,7 @@
+ #include <subcmd/parse-options.h>
+ 
+ extern const struct option check_options[];
+-extern bool no_fp, no_unreachable, retpoline, module, backtrace, uaccess, stats, validate_dup, vmlinux, mcount;
++extern bool no_fp, no_unreachable, retpoline, module, backtrace, uaccess, stats, validate_dup, vmlinux, mcount, noinstr;
+ 
+ extern int cmd_check(int argc, const char **argv);
+ extern int cmd_orc(int argc, const char **argv);
+diff --git a/tools/objtool/check.c b/tools/objtool/check.c
+index ab87fb92793ce..85993e606782b 100644
+--- a/tools/objtool/check.c
++++ b/tools/objtool/check.c
+@@ -244,7 +244,7 @@ static void init_insn_state(struct insn_state *state, struct section *sec)
+ 	 * not correctly determine insn->call_dest->sec (external symbols do
+ 	 * not have a section).
+ 	 */
+-	if (vmlinux && sec)
++	if (vmlinux && noinstr && sec)
+ 		state->noinstr = sec->noinstr;
+ }
+ 
+-- 
+cgit 1.2.3-1.el7
+
+
+From b1a1a1a09b4606d41723a426110382d2077c26fb Mon Sep 17 00:00:00 2001
+From: Sami Tolvanen <samitolvanen@google.com>
+Date: Mon, 13 Apr 2020 16:10:13 -0700
+Subject: kbuild: lto: postpone objtool
+
+With LTO, LLVM bitcode won't be compiled into native code until
+modpost_link, or modfinal for modules. This change postpones calls
+to objtool until after these steps, and moves objtool_args to
+Makefile.lib, so the arguments can be reused in Makefile.modfinal.
+
+As we didn't have objects to process earlier, we use --duplicate
+when processing vmlinux.o. This change also disables unreachable
+instruction warnings with LTO to avoid warnings about the int3
+padding between functions.
+
+Signed-off-by: Sami Tolvanen <samitolvanen@google.com>
+Reviewed-by: Kees Cook <keescook@chromium.org>
+---
+ scripts/Makefile.build    | 22 ++--------------------
+ scripts/Makefile.lib      | 12 ++++++++++++
+ scripts/Makefile.modfinal | 19 ++++++++++++++++---
+ scripts/link-vmlinux.sh   | 28 +++++++++++++++++++++++++---
+ 4 files changed, 55 insertions(+), 26 deletions(-)
+
+diff --git a/scripts/Makefile.build b/scripts/Makefile.build
+index 59fabd9685eec..3f6bf0ea7c0eb 100644
+--- a/scripts/Makefile.build
++++ b/scripts/Makefile.build
+@@ -218,30 +218,11 @@ cmd_record_mcount = $(if $(findstring $(strip $(CC_FLAGS_FTRACE)),$(_c_flags)),
+ endif # CONFIG_FTRACE_MCOUNT_USE_RECORDMCOUNT
+ 
+ ifdef CONFIG_STACK_VALIDATION
++ifndef CONFIG_LTO_CLANG
+ ifneq ($(SKIP_STACK_VALIDATION),1)
+ 
+ __objtool_obj := $(objtree)/tools/objtool/objtool
+ 
+-objtool_args = $(if $(CONFIG_UNWINDER_ORC),orc generate,check)
+-
+-objtool_args += $(if $(part-of-module), --module,)
+-
+-ifndef CONFIG_FRAME_POINTER
+-objtool_args += --no-fp
+-endif
+-ifdef CONFIG_GCOV_KERNEL
+-objtool_args += --no-unreachable
+-endif
+-ifdef CONFIG_RETPOLINE
+-  objtool_args += --retpoline
+-endif
+-ifdef CONFIG_X86_SMAP
+-  objtool_args += --uaccess
+-endif
+-ifdef CONFIG_FTRACE_MCOUNT_USE_OBJTOOL
+-  objtool_args += --mcount
+-endif
+-
+ # 'OBJECT_FILES_NON_STANDARD := y': skip objtool checking for a directory
+ # 'OBJECT_FILES_NON_STANDARD_foo.o := 'y': skip objtool checking for a file
+ # 'OBJECT_FILES_NON_STANDARD_foo.o := 'n': override directory skip for a file
+@@ -253,6 +234,7 @@ objtool_obj = $(if $(patsubst y%,, \
+ 	$(__objtool_obj))
+ 
+ endif # SKIP_STACK_VALIDATION
++endif # CONFIG_LTO_CLANG
+ endif # CONFIG_STACK_VALIDATION
+ 
+ # Rebuild all objects when objtool changes, or is enabled/disabled.
+diff --git a/scripts/Makefile.lib b/scripts/Makefile.lib
+index 3ff3dbb3a830c..6d004143c4d7a 100644
+--- a/scripts/Makefile.lib
++++ b/scripts/Makefile.lib
+@@ -220,6 +220,18 @@ dtc_cpp_flags  = -Wp,-MMD,$(depfile).pre.tmp -nostdinc                    \
+ 		 $(addprefix -I,$(DTC_INCLUDE))                          \
+ 		 -undef -D__DTS__
+ 
++# Objtool arguments are also needed for modfinal with LTO, so we define
++# then here to avoid duplication.
++objtool_args =								\
++	$(if $(CONFIG_UNWINDER_ORC),orc generate,check)			\
++	$(if $(part-of-module), --module,)				\
++	$(if $(CONFIG_FRAME_POINTER),, --no-fp)				\
++	$(if $(or $(CONFIG_GCOV_KERNEL),$(CONFIG_LTO_CLANG)), 		\
++		--no-unreachable,)					\
++	$(if $(CONFIG_RETPOLINE), --retpoline,)				\
++	$(if $(CONFIG_X86_SMAP), --uaccess,)				\
++	$(if $(CONFIG_FTRACE_MCOUNT_USE_OBJTOOL), --mcount,)
++
+ # Useful for describing the dependency of composite objects
+ # Usage:
+ #   $(call multi_depend, multi_used_targets, suffix_to_remove, suffix_to_add)
+diff --git a/scripts/Makefile.modfinal b/scripts/Makefile.modfinal
+index 6de2c35b64e89..735e11e9041b9 100644
+--- a/scripts/Makefile.modfinal
++++ b/scripts/Makefile.modfinal
+@@ -9,7 +9,7 @@ __modfinal:
+ include include/config/auto.conf
+ include $(srctree)/scripts/Kbuild.include
+ 
+-# for c_flags
++# for c_flags and objtool_args
+ include $(srctree)/scripts/Makefile.lib
+ 
+ # find all modules listed in modules.order
+@@ -34,10 +34,23 @@ ifdef CONFIG_LTO_CLANG
+ # With CONFIG_LTO_CLANG, reuse the object file we compiled for modpost to
+ # avoid a second slow LTO link
+ prelink-ext := .lto
+-endif
++
++# ELF processing was skipped earlier because we didn't have native code,
++# so let's now process the prelinked binary before we link the module.
++
++ifdef CONFIG_STACK_VALIDATION
++ifneq ($(SKIP_STACK_VALIDATION),1)
++cmd_ld_ko_o +=								\
++	$(objtree)/tools/objtool/objtool $(objtool_args)		\
++		$(@:.ko=$(prelink-ext).o);
++
++endif # SKIP_STACK_VALIDATION
++endif # CONFIG_STACK_VALIDATION
++
++endif # CONFIG_LTO_CLANG
+ 
+ quiet_cmd_ld_ko_o = LD [M]  $@
+-      cmd_ld_ko_o =                                                     \
++      cmd_ld_ko_o +=							\
+ 	$(LD) -r $(KBUILD_LDFLAGS)					\
+ 		$(KBUILD_LDFLAGS_MODULE) $(LDFLAGS_MODULE)		\
+ 		-T scripts/module.lds -o $@ $(filter %.o, $^);		\
+diff --git a/scripts/link-vmlinux.sh b/scripts/link-vmlinux.sh
+index 18aed761f9c04..3b261b0f74f0a 100755
+--- a/scripts/link-vmlinux.sh
++++ b/scripts/link-vmlinux.sh
+@@ -103,14 +103,36 @@ modpost_link()
+ 
+ objtool_link()
+ {
++	local objtoolcmd;
+ 	local objtoolopt;
+ 
++	if [ "${CONFIG_LTO_CLANG} ${CONFIG_STACK_VALIDATION}" = "y y" ]; then
++		# Don't perform vmlinux validation unless explicitly requested,
++		# but run objtool on vmlinux.o now that we have an object file.
++		if [ -n "${CONFIG_UNWINDER_ORC}" ]; then
++			objtoolcmd="orc generate"
++		fi
++
++		objtoolopt="${objtoolopt} --duplicate"
++
++		if [ -n "${CONFIG_FTRACE_MCOUNT_USE_OBJTOOL}" ]; then
++			objtoolopt="${objtoolopt} --mcount"
++		fi
++	fi
++
+ 	if [ -n "${CONFIG_VMLINUX_VALIDATION}" ]; then
+-		objtoolopt="check --vmlinux --noinstr"
++		objtoolopt="${objtoolopt} --noinstr"
++	fi
++
++	if [ -n "${objtoolopt}" ]; then
++		if [ -z "${objtoolcmd}" ]; then
++			objtoolcmd="check"
++		fi
++		objtoolopt="${objtoolopt} --vmlinux"
+ 		if [ -z "${CONFIG_FRAME_POINTER}" ]; then
+ 			objtoolopt="${objtoolopt} --no-fp"
+ 		fi
+-		if [ -n "${CONFIG_GCOV_KERNEL}" ]; then
++		if [ -n "${CONFIG_GCOV_KERNEL}" ] || [ -n "${CONFIG_LTO_CLANG}" ]; then
+ 			objtoolopt="${objtoolopt} --no-unreachable"
+ 		fi
+ 		if [ -n "${CONFIG_RETPOLINE}" ]; then
+@@ -120,7 +142,7 @@ objtool_link()
+ 			objtoolopt="${objtoolopt} --uaccess"
+ 		fi
+ 		info OBJTOOL ${1}
+-		tools/objtool/objtool ${objtoolopt} ${1}
++		tools/objtool/objtool ${objtoolcmd} ${objtoolopt} ${1}
+ 	fi
+ }
+ 
+-- 
+cgit 1.2.3-1.el7
+
+
+From e242db40be271793b248bf0ad1b7d7bd6359dc76 Mon Sep 17 00:00:00 2001
+From: Sami Tolvanen <samitolvanen@google.com>
+Date: Tue, 16 Apr 2019 14:40:00 -0700
+Subject: x86, vdso: disable LTO only for vDSO
+
+Disable LTO for the vDSO. Note that while we could use Clang's LTO
+for the 64-bit vDSO, it won't add noticeable benefit for the small
+amount of C code.
+
+Signed-off-by: Sami Tolvanen <samitolvanen@google.com>
+Reviewed-by: Kees Cook <keescook@chromium.org>
+---
+ arch/x86/entry/vdso/Makefile | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/entry/vdso/Makefile b/arch/x86/entry/vdso/Makefile
+index 02e3e42f380bd..05c4abc2fdfde 100644
+--- a/arch/x86/entry/vdso/Makefile
++++ b/arch/x86/entry/vdso/Makefile
+@@ -91,7 +91,7 @@ ifneq ($(RETPOLINE_VDSO_CFLAGS),)
+ endif
+ endif
+ 
+-$(vobjs): KBUILD_CFLAGS := $(filter-out $(GCC_PLUGINS_CFLAGS) $(RETPOLINE_CFLAGS),$(KBUILD_CFLAGS)) $(CFL)
++$(vobjs): KBUILD_CFLAGS := $(filter-out $(CC_FLAGS_LTO) $(GCC_PLUGINS_CFLAGS) $(RETPOLINE_CFLAGS),$(KBUILD_CFLAGS)) $(CFL)
+ 
+ #
+ # vDSO code runs in userspace and -pg doesn't help with profiling anyway.
+@@ -150,6 +150,7 @@ KBUILD_CFLAGS_32 := $(filter-out -fno-pic,$(KBUILD_CFLAGS_32))
+ KBUILD_CFLAGS_32 := $(filter-out -mfentry,$(KBUILD_CFLAGS_32))
+ KBUILD_CFLAGS_32 := $(filter-out $(GCC_PLUGINS_CFLAGS),$(KBUILD_CFLAGS_32))
+ KBUILD_CFLAGS_32 := $(filter-out $(RETPOLINE_CFLAGS),$(KBUILD_CFLAGS_32))
++KBUILD_CFLAGS_32 := $(filter-out $(CC_FLAGS_LTO),$(KBUILD_CFLAGS_32))
+ KBUILD_CFLAGS_32 += -m32 -msoft-float -mregparm=0 -fpic
+ KBUILD_CFLAGS_32 += -fno-stack-protector
+ KBUILD_CFLAGS_32 += $(call cc-option, -foptimize-sibling-calls)
+-- 
+cgit 1.2.3-1.el7
+
+
+From d2dcd3e37475a66012f9702c4f9f0863ccdae716 Mon Sep 17 00:00:00 2001
+From: Sami Tolvanen <samitolvanen@google.com>
+Date: Wed, 16 Sep 2020 12:57:56 -0700
+Subject: x86, cpu: disable LTO for cpu.c
+
+Clang incorrectly inlines functions with differing stack protector
+attributes, which breaks __restore_processor_state() that relies on
+stack protector being disabled. This change disables LTO for cpu.c
+to work aroung the bug.
+
+Link: https://bugs.llvm.org/show_bug.cgi?id=47479
+Suggested-by: Nick Desaulniers <ndesaulniers@google.com>
+Signed-off-by: Sami Tolvanen <samitolvanen@google.com>
+---
+ arch/x86/power/Makefile | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/arch/x86/power/Makefile b/arch/x86/power/Makefile
+index 6907b523e856b..5f711a4416236 100644
+--- a/arch/x86/power/Makefile
++++ b/arch/x86/power/Makefile
+@@ -5,5 +5,9 @@ OBJECT_FILES_NON_STANDARD_hibernate_asm_$(BITS).o := y
+ # itself be stack-protected
+ CFLAGS_cpu.o	:= -fno-stack-protector
+ 
++# Clang may incorrectly inline functions with stack protector enabled into
++# __restore_processor_state(): https://bugs.llvm.org/show_bug.cgi?id=47479
++CFLAGS_REMOVE_cpu.o := $(CC_FLAGS_LTO)
++
+ obj-$(CONFIG_PM_SLEEP)		+= cpu.o
+ obj-$(CONFIG_HIBERNATION)	+= hibernate_$(BITS).o hibernate_asm_$(BITS).o hibernate.o
+-- 
+cgit 1.2.3-1.el7
+
+
+From b33fff07e3e3817d94dbec7bf2040070ecd96d16 Mon Sep 17 00:00:00 2001
+From: Sami Tolvanen <samitolvanen@google.com>
+Date: Wed, 10 Apr 2019 14:17:20 -0700
+Subject: x86, build: allow LTO to be selected
+
+Pass code model and stack alignment to the linker as these are not
+stored in LLVM bitcode, and allow CONFIG_LTO_CLANG* to be enabled.
+
+Signed-off-by: Sami Tolvanen <samitolvanen@google.com>
+Reviewed-by: Kees Cook <keescook@chromium.org>
+---
+ arch/x86/Kconfig  | 2 ++
+ arch/x86/Makefile | 5 +++++
+ 2 files changed, 7 insertions(+)
+
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index 9cd9bd6562e34..c15d16f1a971a 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -95,6 +95,8 @@ config X86
+ 	select ARCH_SUPPORTS_DEBUG_PAGEALLOC
+ 	select ARCH_SUPPORTS_NUMA_BALANCING	if X86_64
+ 	select ARCH_SUPPORTS_KMAP_LOCAL_FORCE_MAP	if NR_CPUS <= 4096
++	select ARCH_SUPPORTS_LTO_CLANG		if X86_64
++	select ARCH_SUPPORTS_LTO_CLANG_THIN	if X86_64
+ 	select ARCH_USE_BUILTIN_BSWAP
+ 	select ARCH_USE_QUEUED_RWLOCKS
+ 	select ARCH_USE_QUEUED_SPINLOCKS
+diff --git a/arch/x86/Makefile b/arch/x86/Makefile
+index 7116da3980be4..845baf58d1472 100644
+--- a/arch/x86/Makefile
++++ b/arch/x86/Makefile
+@@ -166,6 +166,11 @@ ifeq ($(ACCUMULATE_OUTGOING_ARGS), 1)
+ 	KBUILD_CFLAGS += $(call cc-option,-maccumulate-outgoing-args,)
+ endif
+ 
++ifdef CONFIG_LTO_CLANG
++KBUILD_LDFLAGS	+= -plugin-opt=-code-model=kernel \
++		   -plugin-opt=-stack-alignment=$(if $(CONFIG_X86_32),4,8)
++endif
++
+ # Workaround for a gcc prelease that unfortunately was shipped in a suse release
+ KBUILD_CFLAGS += -Wno-sign-compare
+ #
+-- 
+cgit 1.2.3-1.el7
+
+
+From 5e95325fbbbdea96de91e7bdb05fe95a3031e37d Mon Sep 17 00:00:00 2001
+From: Sami Tolvanen <samitolvanen@google.com>
+Date: Tue, 23 Feb 2021 13:59:52 -0800
+Subject: kbuild: lto: force rebuilds when switching CONFIG_LTO
+
+When doing non-clean builds and switching between CONFIG_LTO=n and
+CONFIG_LTO=y, the build system (correctly) didn't notice that assembly
+and LTO-excluded C object files were rewritten in place by objtool (to
+add the .orc_unwind* sections), since their build command lines were the
+same between CONFIG_LTO=y and CONFIG_LTO=n. The objtool step would fail:
+
+vmlinux.o: warning: objtool: file already has .orc_unwind section, skipping
+make: *** [Makefile:1194: vmlinux] Error 255
+
+Avoid this by making sure the build will see a difference between an LTO
+and non-LTO build (by including "-fno-lto" in KBUILD_*FLAGS). This will
+get ignored when CC_FLAGS_LTO is present, and will not be included at
+all when CONFIG_LTO=n.
+
+Signed-off-by: Sami Tolvanen <samitolvanen@google.com>
+Signed-off-by: Kees Cook <keescook@chromium.org>
+---
+ Makefile | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/Makefile b/Makefile
+index 3189eacf31859..639873def1fd7 100644
+--- a/Makefile
++++ b/Makefile
+@@ -910,7 +910,8 @@ KBUILD_LDFLAGS += -mllvm -import-instr-limit=5
+ endif
+ 
+ ifdef CONFIG_LTO
+-KBUILD_CFLAGS	+= $(CC_FLAGS_LTO)
++KBUILD_CFLAGS	+= -fno-lto $(CC_FLAGS_LTO)
++KBUILD_AFLAGS	+= -fno-lto
+ export CC_FLAGS_LTO
+ endif
+ 
+-- 
+cgit 1.2.3-1.el7
+
