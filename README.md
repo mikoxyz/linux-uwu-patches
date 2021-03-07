@@ -65,10 +65,10 @@
 * Source: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/patch/?id=414eece95b98b209cef0f49cfcac108fd00b8ced
 * Modifications: None
 
-# enable_additional_cpu_optimizations_for_gcc_v11.0+_kernel_v5.8+.patch
+# enable_additional_cpu_optimizations_for_gcc_v10.1+_kernel_v5.8+.patch
 * Patch name(s): enable_additional_cpu_optimizations_for_gcc_v11.0+_kernel_v5.8+.patch 
 * Author(s): [graysky](graysky@archlinux.us)
-* Source: https://raw.githubusercontent.com/graysky2/kernel_gcc_patch/master/enable_additional_cpu_optimizations_for_gcc_v11.0%2B_kernel_v5.8%2B.patch
+* Source: https://raw.githubusercontent.com/graysky2/kernel_gcc_patch/master/enable_additional_cpu_optimizations_for_gcc_v10.1%2B_kernel_v5.8%2B.patch
 * Modifications: None
 
 # enable-o3.patch
