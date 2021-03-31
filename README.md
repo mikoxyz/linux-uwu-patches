@@ -65,10 +65,10 @@
 * Source: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/patch/?id=414eece95b98b209cef0f49cfcac108fd00b8ced
 * Modifications: None
 
-# more-uarches-for-gcc-v10-and-kernel-5.8+.patch 
-* Patch name(s): more-uarches-for-gcc-v10-and-kernel-5.8+.patch
+# more-uarches-for-kernel-5.8+.patch 
+* Patch name(s): more-uarches-for-kernel-5.8+.patch
 * Author(s): [graysky](graysky@archlinux.us)
-* Source: https://raw.githubusercontent.com/graysky2/kernel_gcc_patch/master/more-uarches-for-gcc-v10-and-kernel-5.8%2B.patch
+* Source: https://raw.githubusercontent.com/graysky2/kernel_gcc_patch/master/more-uarches-for-kernel-5.8%2B.patch
 * Modifications: None
 
 # enable-o3.patch
